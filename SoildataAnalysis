@@ -1,0 +1,470 @@
+# =============================================================================
+# Soil Fertility Dataset Exploration Script
+# Purpose: Analyze structure, soil data, and images for fertility prediction
+# Adapted for soil fertility dataset structure
+# =============================================================================
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from PIL import Image
+from collections import Counter
+import warnings
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# 1. CONFIGURATION & PATH SETUP - ADAPTED FOR SOIL FERTILITY DATA
+# =============================================================================
+
+# Import your existing config
+
+from config import CSV_PATH, DOWNLOAD_DIR, SUFFIXES, SCORE_WEIGHTS, IMAGE_SHAPE
+# except ImportError:
+#     # Fallback to your soil fertility code defaults
+#     CSV_PATH = "soil_data.csv"
+#     DOWNLOAD_DIR = "./images"
+#     SUFFIXES = ["", "_sat"]
+#     SCORE_WEIGHTS = {
+#         'ph': {'min': 3.5, 'max': 9.0, 'weight': 0.25},
+#         'oc': {'max': 50.0, 'weight': 0.35},
+#         'nutrients': {'weight': 0.25},
+#         'land_use': {'weight': 0.15}
+#     }
+#     IMAGE_SHAPE = (224, 224, 3)
+
+PROJECT_ROOT = os.getcwd()
+csv_file = os.path.join(PROJECT_ROOT, CSV_PATH)
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+image_folder = os.path.join(DATA_DIR, "Photo")
+
+
+print(f"📁 Project root: {PROJECT_ROOT}")
+print(f"📊 CSV file: {csv_file}")
+print(f"🖼️  Image folder: {image_folder}")
+print(f"🔍 Image suffixes: {SUFFIXES}")
+
+# Validate paths
+if not os.path.exists(csv_file):
+    raise FileNotFoundError(f"CSV file not found: {csv_file}")
+if not os.path.exists(image_folder):
+    raise FileNotFoundError(f"Image directory not found: {image_folder}")
+
+# =============================================================================
+# 2. SOIL FERTILITY CLASS DEFINITIONS (Based on your code)
+# =============================================================================
+
+FERTILITY_CLASSES = {
+    'Low': 'Low Fertility',
+    'Moderate': 'Moderate Fertility', 
+    'High': 'High Fertility'
+}
+
+FERTILITY_COLORS = {
+    'Low': '#FF6B6B',      # Red
+    'Moderate': '#FFD93D',  # Yellow
+    'High': '#6BCF77'       # Green
+}
+
+OC_CLASSES = {
+    'Low': 'OC < 10',
+    'Moderate': 'OC 10-20', 
+    'High': 'OC > 20'
+}
+
+PH_CLASSES = {
+    'Acidic': 'pH < 5.5',
+    'Neutral': 'pH 5.5-6.8',
+    'Alkaline': 'pH > 6.8'
+}
+
+print("\n🌱 Soil Fertility Classes:")
+for class_name, description in FERTILITY_CLASSES.items():
+    print(f"  {class_name} → {description}")
+
+# =============================================================================
+# 3. LOAD AND CLEAN SOIL DATA (From your fertility code)
+# =============================================================================
+
+print("\n📥 Loading soil data...")
+
+def load_and_clean_data(csv_path):
+    """Load and clean soil data with robust error handling"""
+    try:
+        df = pd.read_csv(csv_path, low_memory=False)
+        print(f"✅ Raw data loaded: {df.shape[0]:,} rows, {df.shape[1]} columns")
+    except Exception as e:
+        print(f"❌ Failed to load data: {e}")
+        sys.exit(1)
+    
+    # Clean numeric columns (from your code)
+    numeric_cols = ['OC', 'pH_H2O', 'P', 'K', 'N', 'EC', 'CaCO3', 
+                   'OC (20-30 cm)', 'CaCO3 (20-30 cm)', 'Ox_Al', 'Ox_Fe']
+    
+    for col in numeric_cols:
+        if col in df.columns:
+            # Clean the column
+            cleaned = df[col].astype(str).str.replace('< LOD', '', regex=False)
+            cleaned = pd.to_numeric(cleaned, errors='coerce')
+            if cleaned.notna().sum() > 0:
+                df[col] = cleaned.fillna(cleaned.median())
+            else:
+                df[col] = cleaned.fillna(0.0)
+    
+    # Handle categorical data
+    if 'Depth' in df.columns:
+        df['Depth_code'] = pd.Categorical(df['Depth']).codes
+    
+    if 'LU1_Desc' in df.columns:
+        df['land_use_code'] = pd.Categorical(df['LU1_Desc']).codes
+    else:
+        df['LU1_Desc'] = 'Unknown'
+        df['land_use_code'] = 0
+    
+    return df
+
+df_soil = load_and_clean_data(csv_file)
+
+# =============================================================================
+# 4. CLASSIFY SOIL FERTILITY (From your code)
+# =============================================================================
+
+print("\n🌿 Classifying soil fertility...")
+
+def classify_soil_fertility(df):
+    """Classify soil fertility based on OC and pH levels"""
+    # Safeguard for missing columns
+    if 'OC' not in df.columns:
+        df['OC'] = 10.0
+    if 'pH_H2O' not in df.columns:
+        df['pH_H2O'] = 6.5
+        
+    # Organic Carbon classification
+    conditions_oc = [
+        (df['OC'] < 10),
+        (df['OC'] >= 10) & (df['OC'] <= 20),
+        (df['OC'] > 20)
+    ]
+    df['OC_Class'] = np.select(conditions_oc, ['Low', 'Moderate', 'High'], default='Moderate')
+    
+    # pH classification  
+    conditions_ph = [
+        (df['pH_H2O'] < 5.5),
+        (df['pH_H2O'] >= 5.5) & (df['pH_H2O'] <= 6.8),
+        (df['pH_H2O'] > 6.8)
+    ]
+    df['pH_Class'] = np.select(conditions_ph, ['Acidic', 'Neutral', 'Alkaline'], default='Neutral')
+    
+    # Combined fertility classification
+    conditions_fertility = [
+        (df['OC'] < 10) | (df['pH_H2O'] < 5.5),
+        ((df['OC'] >= 10) & (df['OC'] <= 20)) & (df['pH_H2O'] >= 5.5) & (df['pH_H2O'] <= 6.8),
+        (df['OC'] > 20) | (df['pH_H2O'] > 6.8)
+    ]
+    df['Fertility_Class'] = np.select(conditions_fertility, ['Low', 'Moderate', 'High'], default='Moderate')
+    
+    return df
+
+df_soil = classify_soil_fertility(df_soil)
+
+# =============================================================================
+# 5. BUILD IMAGE PATHS (Adapted to your directory structure)
+# =============================================================================
+
+print("\n🔍 Building image paths...")
+
+def find_image_path(pointid, nut0, download_dir, suffixes):
+    """Find image path using your directory structure"""
+    if not pointid or str(pointid) == 'nan':
+        return None
+        
+    # Your directory search patterns
+    search_patterns = []
+    for suffix in suffixes:
+        search_patterns.extend([
+            os.path.join(download_dir, nut0, str(pointid)[:3], str(pointid)[3:6], f"{pointid}{suffix}.jpg"),
+            os.path.join(download_dir, nut0, str(pointid)[:4], str(pointid)[4:6], f"{pointid}{suffix}.jpg"),
+            os.path.join(download_dir, nut0, str(pointid), f"{pointid}{suffix}.jpg"),
+            os.path.join(download_dir, nut0, f"{pointid}{suffix}.jpg"),
+            os.path.join(download_dir, f"{pointid}{suffix}.jpg")
+        ])
+    
+    for pattern in search_patterns:
+        if os.path.exists(pattern):
+            return pattern
+    return None
+
+# Add image paths to dataframe
+image_paths = []
+photo_exists = []
+
+for _, row in df_soil.iterrows():
+    pointid = str(row.get('POINTID', ''))
+    nut0 = str(row.get('NUTS_0', 'UNKNOWN')).upper()
+    
+    image_path = find_image_path(pointid, nut0, image_folder, SUFFIXES)
+    image_paths.append(image_path)
+    photo_exists.append(image_path is not None and os.path.exists(image_path))
+
+df_soil['photo_path'] = image_paths
+df_soil['photo_exists'] = photo_exists
+
+# Filter to only samples with images
+df_valid = df_soil[df_soil['photo_exists']].copy().reset_index(drop=True)
+df_missing = df_soil[~df_soil['photo_exists']]
+
+print(f"✅ Samples with images: {len(df_valid):,}")
+print(f"⚠️  Samples without images: {len(df_missing):,}")
+
+if len(df_missing) > 0:
+    print("   Example missing POINTIDs:", df_missing['POINTID'].head().tolist())
+
+# =============================================================================
+# 6. DETAILED STATISTICAL SUMMARY
+# =============================================================================
+
+print("\n📊 Soil Dataset Summary:")
+print("-" * 50)
+print(f"Total soil samples: {len(df_soil):,}")
+print(f"Samples with images: {len(df_valid):,} ({len(df_valid)/len(df_soil)*100:.1f}%)")
+
+# Fertility class distribution
+fertility_counts = df_valid['Fertility_Class'].value_counts()
+fertility_percent = (fertility_counts / len(df_valid)) * 100
+
+print("\n🌱 Fertility Class Distribution:")
+print("-" * 50)
+for class_name in FERTILITY_CLASSES.keys():
+    count = fertility_counts.get(class_name, 0)
+    pct = fertility_percent.get(class_name, 0)
+    print(f"{class_name:<10} | {count:>6,} samples ({pct:>5.1f}%)")
+
+# OC and pH distribution
+print("\n📈 Soil Property Statistics:")
+print("-" * 50)
+if 'OC' in df_valid.columns:
+    print(f"Organic Carbon (OC): {df_valid['OC'].mean():.2f} ± {df_valid['OC'].std():.2f}")
+if 'pH_H2O' in df_valid.columns:
+    print(f"pH in Water: {df_valid['pH_H2O'].mean():.2f} ± {df_valid['pH_H2O'].std():.2f}")
+if 'N' in df_valid.columns:
+    print(f"Nitrogen (N): {df_valid['N'].mean():.2f} ± {df_valid['N'].std():.2f}")
+if 'P' in df_valid.columns:
+    print(f"Phosphorus (P): {df_valid['P'].mean():.2f} ± {df_valid['P'].std():.2f}")
+if 'K' in df_valid.columns:
+    print(f"Potassium (K): {df_valid['K'].mean():.2f} ± {df_valid['K'].std():.2f}")
+
+# =============================================================================
+# 7. VISUALIZE FERTILITY DISTRIBUTION
+# =============================================================================
+
+print("\n🖼️  Generating fertility distribution plots...")
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# Fertility class distribution
+if not df_valid.empty:
+    fertility_counts = df_valid['Fertility_Class'].value_counts()
+    colors = [FERTILITY_COLORS.get(cls, 'gray') for cls in fertility_counts.index]
+    
+    # Bar plot
+    bars = axes[0,0].bar(fertility_counts.index, fertility_counts.values, color=colors)
+    axes[0,0].set_title('Soil Fertility Class Distribution', fontsize=14, fontweight='bold')
+    axes[0,0].set_ylabel('Number of Samples')
+    axes[0,0].tick_params(axis='x', rotation=45)
+    
+    # Annotate bars
+    for bar, count in zip(bars, fertility_counts.values):
+        axes[0,0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(fertility_counts)*0.01,
+                     f'{count:,}', ha='center', va='bottom', fontsize=10)
+
+    # Pie chart
+    wedges, texts, autotexts = axes[0,1].pie(
+        fertility_counts.values,
+        labels=fertility_counts.index,
+        colors=colors,
+        autopct='%1.1f%%',
+        startangle=90
+    )
+    axes[0,1].set_title('Soil Fertility Distribution', fontsize=14, fontweight='bold')
+
+# OC distribution
+if 'OC' in df_valid.columns:
+    axes[1,0].hist(df_valid['OC'].dropna(), bins=30, color='skyblue', edgecolor='black', alpha=0.7)
+    axes[1,0].set_title('Organic Carbon (OC) Distribution', fontsize=14, fontweight='bold')
+    axes[1,0].set_xlabel('OC (%)')
+    axes[1,0].set_ylabel('Frequency')
+
+# pH distribution  
+if 'pH_H2O' in df_valid.columns:
+    axes[1,1].hist(df_valid['pH_H2O'].dropna(), bins=30, color='lightcoral', edgecolor='black', alpha=0.7)
+    axes[1,1].set_title('pH in Water Distribution', fontsize=14, fontweight='bold')
+    axes[1,1].set_xlabel('pH')
+    axes[1,1].set_ylabel('Frequency')
+
+plt.tight_layout()
+plt.savefig(os.path.join(PROJECT_ROOT, "soil_fertility_distribution.png"), dpi=150, bbox_inches='tight')
+plt.show()
+
+# =============================================================================
+# 8. VISUALIZE SAMPLE IMAGES BY FERTILITY CLASS
+# =============================================================================
+
+print("\n🖼️  Generating sample image grid by fertility class...")
+
+if not df_valid.empty:
+    n_classes = len(FERTILITY_CLASSES)
+    cols = 3
+    rows = (n_classes + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+    axes = axes.flatten() if n_classes > 1 else [axes]
+
+    for idx, (class_name, description) in enumerate(FERTILITY_CLASSES.items()):
+        ax = axes[idx]
+        # Get samples from this fertility class
+        class_samples = df_valid[df_valid['Fertility_Class'] == class_name]
+        
+        if not class_samples.empty:
+            # Try to get a sample with valid image path
+            valid_samples = class_samples[class_samples['photo_path'].notna()]
+            if not valid_samples.empty:
+                sample_row = valid_samples.sample(1).iloc[0]
+                img_path = sample_row['photo_path']
+                try:
+                    img = mpimg.imread(img_path)
+                    ax.imshow(img)
+                    title = f"{class_name} Fertility\n"
+                    title += f"OC: {sample_row.get('OC', 'N/A'):.1f}%, "
+                    title += f"pH: {sample_row.get('pH_H2O', 'N/A'):.1f}\n"
+                    title += f"ID: {sample_row.get('POINTID', 'N/A')}"
+                    ax.set_title(title, fontsize=10)
+                except Exception as e:
+                    ax.text(0.5, 0.5, f"Image load error", 
+                            ha='center', va='center', transform=ax.transAxes, color='red')
+                    ax.set_title(f"{class_name} Fertility", fontsize=10)
+            else:
+                ax.text(0.5, 0.5, f"{class_name}\n(NO IMAGES)", 
+                        ha='center', va='center', transform=ax.transAxes, color='gray')
+        else:
+            ax.text(0.5, 0.5, f"{class_name}\n(NO SAMPLES)", 
+                    ha='center', va='center', transform=ax.transAxes, color='gray')
+        ax.axis('off')
+
+    # Hide unused subplots
+    for j in range(idx + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.suptitle('Sample Soil Images by Fertility Class', fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(os.path.join(PROJECT_ROOT, "soil_sample_images.png"), dpi=150, bbox_inches='tight')
+    plt.show()
+
+# =============================================================================
+# 9. IMAGE QUALITY & DIMENSIONS ANALYSIS
+# =============================================================================
+
+print("\n🔍 Analyzing image dimensions...")
+
+def get_image_size(path):
+    try:
+        with Image.open(path) as img:
+            return img.size  # (width, height)
+    except:
+        return (None, None)
+
+# Sample images to avoid long processing
+sample_size = min(200, len(df_valid))
+if sample_size > 0:
+    sample_df = df_valid.sample(n=sample_size, random_state=42)
+    sample_df['img_width'], sample_df['img_height'] = zip(*sample_df['photo_path'].apply(get_image_size))
+    
+    # Remove failed reads
+    sample_df = sample_df.dropna(subset=['img_width', 'img_height'])
+    sample_df['img_width'] = sample_df['img_width'].astype(int)
+    sample_df['img_height'] = sample_df['img_height'].astype(int)
+    sample_df['aspect_ratio'] = sample_df['img_width'] / sample_df['img_height']
+    
+    print(f"✅ Analyzed {len(sample_df)} images")
+    print(f"📏 Avg. width: {sample_df['img_width'].mean():.0f} px")
+    print(f"📏 Avg. height: {sample_df['img_height'].mean():.0f} px")
+    print(f"📐 Avg. aspect ratio: {sample_df['aspect_ratio'].mean():.2f}")
+    
+    # Plot dimensions
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    
+    ax[0].hist(sample_df['img_width'], bins=20, color='skyblue', edgecolor='black', alpha=0.7)
+    ax[0].set_title('Image Width Distribution')
+    ax[0].set_xlabel('Width (pixels)')
+    ax[0].set_ylabel('Frequency')
+    
+    ax[1].hist(sample_df['img_height'], bins=20, color='lightgreen', edgecolor='black', alpha=0.7)
+    ax[1].set_title('Image Height Distribution')
+    ax[1].set_xlabel('Height (pixels)')
+    ax[1].set_ylabel('Frequency')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(PROJECT_ROOT, "soil_image_dimensions.png"), dpi=150, bbox_inches='tight')
+    plt.show()
+
+# =============================================================================
+# 10. CORRELATION ANALYSIS OF SOIL PARAMETERS
+# =============================================================================
+
+print("\n📈 Analyzing soil parameter correlations...")
+
+# Select numeric soil parameters for correlation analysis
+soil_params = ['OC', 'pH_H2O', 'P', 'K', 'N', 'EC', 'CaCO3']
+available_params = [param for param in soil_params if param in df_valid.columns]
+
+if len(available_params) >= 2:
+    corr_matrix = df_valid[available_params].corr()
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(corr_matrix.values, cmap='coolwarm', vmin=-1, vmax=1)
+    
+    # Show correlation values
+    for i in range(len(available_params)):
+        for j in range(len(available_params)):
+            text = ax.text(j, i, f'{corr_matrix.iloc[i, j]:.2f}',
+                          ha="center", va="center", color="black", fontsize=10)
+    
+    ax.set_xticks(range(len(available_params)))
+    ax.set_yticks(range(len(available_params)))
+    ax.set_xticklabels(available_params, rotation=45)
+    ax.set_yticklabels(available_params)
+    ax.set_title('Soil Parameter Correlation Matrix', fontsize=14, fontweight='bold')
+    
+    plt.colorbar(im)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PROJECT_ROOT, "soil_parameter_correlations.png"), dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Print strong correlations
+    print("\n🔗 Strong Correlations (|r| > 0.5):")
+    for i in range(len(available_params)):
+        for j in range(i+1, len(available_params)):
+            corr = corr_matrix.iloc[i, j]
+            if abs(corr) > 0.5:
+                print(f"  {available_params[i]} ↔ {available_params[j]}: {corr:.3f}")
+
+# =============================================================================
+# 11. SAVE CLEANED DATASET FOR TRAINING
+# =============================================================================
+
+output_path = os.path.join(PROJECT_ROOT, "soil_fertility_clean_data.csv")
+df_valid.to_csv(output_path, index=False)
+print(f"\n💾 Cleaned soil data saved to: {output_path}")
+print(f"   Samples: {len(df_valid):,}")
+print(f"   Columns: {list(df_valid.columns)}")
+
+# Final summary
+print("\n" + "="*70)
+print("✅ SOIL FERTILITY EXPLORATION COMPLETE!")
+print("="*70)
+print(f"Final dataset size: {len(df_valid):,} samples with images")
+print(f"Fertility classes: {len(fertility_counts)}")
+print(f"Key soil parameters: {available_params}")
+print(f"Saved cleaned data for training: {output_path}")
+print("="*70)

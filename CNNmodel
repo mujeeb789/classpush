@@ -1,0 +1,709 @@
+import os
+import numpy as np
+import pandas as pd
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, 
+                           accuracy_score, f1_score, confusion_matrix, classification_report)
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from skimage import exposure
+from config import CSV_PATH, DOWNLOAD_DIR, SUFFIXES, SCORE_WEIGHTS, IMAGE_SHAPE
+
+# Configuration (can be moved to separate config.py if preferred)
+
+
+
+
+EPOCHS = 100
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+PATIENCE = 10
+DROPOUT_RATE = 0.3
+L2_REG = 1e-4
+
+
+# --- DATA LOADING AND PREPROCESSING ---
+def load_and_clean_data(csv_path=CSV_PATH):
+    """Load and clean the soil data with robust numeric conversion"""
+    # Load data with proper numeric parsing
+    
+    df = pd.read_csv(csv_path, 
+                    converters={
+                        'OC': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'pH_H2O': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'P': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'K': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'N': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'EC': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'CaCO3': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'OC (20-30 cm)': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'CaCO3 (20-30 cm)': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'Ox_Al': lambda x: pd.to_numeric(x, errors='coerce'),
+                        'Ox_Fe': lambda x: pd.to_numeric(x, errors='coerce')
+                    })
+    
+    if 'Depth' in df.columns:
+            df['Depth_code'] = pd.Categorical(df['Depth']).codes
+    # Handle special cases like '< LOD' (Limit of Detection)
+    numeric_cols = ['OC', 'pH_H2O', 'P', 'K', 'N', 'EC', 'CaCO3', 
+                   'OC (20-30 cm)', 'CaCO3 (20-30 cm)', 'Ox_Al', 'Ox_Fe']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].replace('< LOD', np.nan)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Fill missing values with median
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+    
+    # Convert land use to categorical codes
+    if 'LU1_Desc' in df.columns:
+        df['land_use_code'] = pd.Categorical(df['LU1_Desc']).codes
+    
+    return df
+
+def classify_soil_fertility(df):
+    """Enhanced fertility classification with categories and scores"""
+    # Individual Parameter Classifications
+    conditions_oc = [
+        (df['OC'] < 10),
+        (df['OC'] >= 10) & (df['OC'] <= 20),
+        (df['OC'] > 20)
+    ]
+    choices_oc = ['Low', 'Moderate', 'High']
+    df['OC_Class'] = np.select(conditions_oc, choices_oc, default='Unknown')
+    
+    conditions_ph = [
+        (df['pH_H2O'] < 5.5),
+        (df['pH_H2O'] >= 5.5) & (df['pH_H2O'] <= 6.8),
+        (df['pH_H2O'] > 6.8)
+    ]
+    choices_ph = ['Acidic', 'Neutral', 'Alkaline']
+    df['pH_Class'] = np.select(conditions_ph, choices_ph, default='Unknown')
+    
+    # Combined Fertility Classification
+    conditions_fertility = [
+        (df['OC'] < 10) | (df['pH_H2O'] < 5.5),
+        ((df['OC'] >= 10) & (df['OC'] <= 20)) & 
+        ((df['pH_H2O'] >= 5.5) & (df['pH_H2O'] <= 6.8)),
+        (df['OC'] > 20) | (df['pH_H2O'] > 6.8)
+    ]
+    choices_fertility = ['Low', 'Moderate', 'High']
+    df['Fertility_Class'] = np.select(conditions_fertility, choices_fertility, default='Unknown')
+    
+    # Enhanced Fertility Score (0-100 scale)
+    df['Fertility_Score_Simple'] = (
+        np.where(df['OC'] < 10, 20,
+        np.where(df['OC'] <= 20, 40, 60)) +
+        np.where(df['pH_H2O'] < 5.5, 10,
+        np.where(df['pH_H2O'] <= 6.8, 30, 40))
+    )
+    
+    return df
+
+def calculate_fertility_score(df, weights=None):
+    """Advanced fertility scoring incorporating multiple factors"""
+    if weights is None:
+        weights = SCORE_WEIGHTS
+    
+    # Ensure required columns exist
+    required_cols = ['pH_H2O', 'OC', 'N', 'P', 'K', 'land_use_code']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    # Normalize each parameter
+    df['ph_norm'] = np.clip(
+        (df['pH_H2O'] - weights['ph']['min']) / 
+        (weights['ph']['max'] - weights['ph']['min']), 
+        0, 1
+    )
+    
+    df['oc_norm'] = np.clip(
+        df['OC'] / weights['oc']['max'], 
+        0, 1
+    )
+    
+    # Calculate nutrient balance index (N:P:K ratio)
+    df['nutrient_balance'] = (
+        np.log1p(df['N'].fillna(0)) + 
+        np.log1p(df['P'].fillna(0)) + 
+        np.log1p(df['K'].fillna(0))
+    )
+    
+    # Normalize nutrient balance
+    if df['nutrient_balance'].nunique() > 1:
+        df['nutrient_balance_norm'] = (
+            (df['nutrient_balance'] - df['nutrient_balance'].min()) / 
+            (df['nutrient_balance'].max() - df['nutrient_balance'].min())
+        )
+    else:
+        df['nutrient_balance_norm'] = 0.5
+    
+    # Normalize land use codes
+    if df['land_use_code'].nunique() > 1:
+        land_use_norm = df['land_use_code'] / df['land_use_code'].max()
+    else:
+        land_use_norm = 0.5
+    
+    # Calculate composite score (0-1 range)
+    df['fertility_score_advanced'] = (
+        weights['ph']['weight'] * df['ph_norm'] +
+        weights['oc']['weight'] * df['oc_norm'] +
+        weights['nutrients']['weight'] * df['nutrient_balance_norm'] +
+        weights['land_use']['weight'] * land_use_norm
+    )
+    
+    # Scale advanced score to 0-100 for comparison
+    df['fertility_score_advanced'] = df['fertility_score_advanced'] * 100
+    
+    return df
+
+def match_images(df, download_dir=DOWNLOAD_DIR, suffixes=SUFFIXES):
+    """Match satellite images to soil samples"""
+    image_rows = []
+    missing = []
+    
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Finding images"):
+        pointid = str(row['POINTID'])
+        nut0 = row['NUTS_0'].upper() if pd.notna(row['NUTS_0']) else 'UNKNOWN'
+        
+        # Try multiple directory structures
+        search_paths = [
+            os.path.join(download_dir, nut0, pointid[:3], pointid[3:6]),
+            os.path.join(download_dir, nut0, pointid[:4], pointid[4:6]),
+            os.path.join(download_dir, nut0, pointid)
+        ]
+        
+        found = False
+        for suffix in suffixes:
+            for base_path in search_paths:
+                filename = f"{pointid}{suffix}.jpg"
+                path = os.path.join(base_path, filename)
+                if os.path.exists(path):
+                    image_rows.append({**row.to_dict(), 'image_path': path})
+                    found = True
+                    break
+            if found:
+                break
+                
+        if not found:
+            missing.append(pointid)
+            
+    return pd.DataFrame(image_rows), missing
+
+def load_image(image_path, target_size=IMAGE_SHAPE[:2]):
+    """Enhanced image loading with preprocessing and error recovery"""
+    try:
+        with Image.open(image_path) as img:
+            img.verify()
+            
+        with Image.open(image_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            if min(img.size) < 10:
+                print(f"Warning: Very small image {image_path} with size {img.size}")
+                return None
+                
+            img = img.resize(target_size, Image.LANCZOS)
+            img_array = np.array(img) / 255.0
+            
+            img_mean = img_array.mean()
+            if img_mean < 0.05 or img_mean > 0.95:
+                img_array = np.stack([
+                    exposure.equalize_hist(img_array[:,:,i]) 
+                    for i in range(3)
+                ], axis=-1)
+                
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+            img_array = (img_array - mean) / std
+            
+            return img_array
+            
+    except (IOError, OSError, Image.DecompressionBombError) as e:
+        print(f"Error loading {image_path}: {str(e)} - Using blank image")
+        return np.zeros((*target_size, 3), dtype=np.float32)
+    except Exception as e:
+        print(f"Unexpected error with {image_path}: {str(e)} - Using blank image")
+        return np.zeros((*target_size, 3), dtype=np.float32)
+
+# --- MODEL ARCHITECTURE ---
+def create_augmentation_layer():
+    """Data augmentation layer for improved generalization"""
+    return tf.keras.Sequential([
+        layers.RandomFlip("horizontal_and_vertical"),
+        layers.RandomRotation(0.2),
+        layers.RandomZoom(0.2),
+        layers.RandomContrast(0.2),
+    ], name="augmentation")
+
+def build_enhanced_model(num_fertility_classes, num_land_use_classes, num_csv_features):
+    """Enhanced multi-task model with transfer learning and feature fusion"""
+    # Input layers
+    img_input = layers.Input(shape=IMAGE_SHAPE, name='image_input')
+    csv_input = layers.Input(shape=(num_csv_features,), name='csv_input')
+    
+    # Data augmentation
+    augmented = create_augmentation_layer()(img_input)
+    
+    # Transfer learning backbone (EfficientNetB3)
+    base_model = tf.keras.applications.EfficientNetB3(
+        include_top=False,
+        weights='imagenet',
+        input_shape=IMAGE_SHAPE,
+        pooling='avg'
+    )
+    base_model.trainable = True
+    
+    # Image feature extraction
+    img_features = base_model(augmented)
+    img_features = layers.Dropout(DROPOUT_RATE)(img_features)
+    
+    # CSV feature processing
+    csv_features = layers.Dense(256, activation='relu')(csv_input)
+    csv_features = layers.BatchNormalization()(csv_features)
+    csv_features = layers.Dropout(DROPOUT_RATE)(csv_features)
+    
+    # Feature fusion
+    combined = layers.Concatenate()([img_features, csv_features])
+    combined = layers.Dense(512, activation='relu')(combined)
+    combined = layers.BatchNormalization()(combined)
+    combined = layers.Dropout(DROPOUT_RATE*1.5)(combined)
+    
+    # Task-specific branches
+    # Fertility regression
+    fertility_reg = layers.Dense(256, activation='relu')(combined)
+    fertility_reg = layers.Dense(128, activation='relu')(fertility_reg)
+    fertility_reg_output = layers.Dense(1, activation='linear', name='fertility_reg')(fertility_reg)
+    
+    # Fertility classification
+    fertility_cls = layers.Dense(256, activation='relu')(combined)
+    fertility_cls = layers.Dense(128, activation='relu')(fertility_cls)
+    fertility_cls_output = layers.Dense(
+        num_fertility_classes, 
+        activation='softmax', 
+        name='fertility_cls'
+    )(fertility_cls)
+    
+    # Land use classification
+    land_use = layers.Dense(256, activation='relu')(combined)
+    land_use = layers.Dense(128, activation='relu')(land_use)
+    land_use_output = layers.Dense(
+        num_land_use_classes, 
+        activation='softmax', 
+        name='land_use'
+    )(land_use)
+    
+    model = models.Model(
+        inputs={'image_input': img_input,'csv_input': csv_input},
+        outputs=[fertility_reg_output, fertility_cls_output, land_use_output]
+    )
+    
+    return model
+
+# --- DATA GENERATOR ---
+class EnhancedSoilGenerator(tf.keras.utils.Sequence):
+    """Advanced data generator combining images and CSV features"""
+    def __init__(self, df, csv_features, batch_size=32, target_size=(256, 256), shuffle=True, **kwargs):
+        super().__init__(**kwargs)
+        self.df = df.copy()
+        self.batch_size = batch_size
+        self.target_size = target_size
+        self.shuffle = shuffle
+        self.csv_features = [f for f in csv_features if f in df.columns]
+        self.on_epoch_end()
+        
+    def __len__(self):
+        return int(np.ceil(len(self.df) / self.batch_size))
+    
+    def __getitem__(self, index):
+        batch_indices = self.indices[index*self.batch_size:(index+1)*self.batch_size]
+        batch_df = self.df.iloc[batch_indices]
+        
+        X_img = np.empty((len(batch_df), *self.target_size, 3), dtype=np.float32)
+        X_csv = np.empty((len(batch_df), len(self.csv_features)), dtype=np.float32)
+        y_reg = np.empty((len(batch_df), 1), dtype=np.float32)
+        y_fert = np.empty((len(batch_df),), dtype=np.int32)
+        y_land = np.empty((len(batch_df),), dtype=np.int32)
+        
+        for i, (_, row) in enumerate(batch_df.iterrows()):
+            img = load_image(row['image_path'], self.target_size)
+            if img is None:
+                img = np.zeros((*self.target_size, 3), dtype=np.float32)
+            
+            X_img[i] = img
+
+            csv_values = []
+            for feature in self.csv_features:
+                val = row[feature]
+                if pd.isna(val):
+                    val = 0.0  # Fill NA with 0
+                try:
+                    csv_values.append(float(val))
+                except ValueError:
+                    csv_values.append(0.0) 
+
+           
+
+            X_csv[i] = row[self.csv_features].values.astype(np.float32)
+            y_reg[i] = row['fertility_score_advanced']
+            y_fert[i] = row['fertility_class_encoded']
+            y_land[i] = row['land_use_encoded']
+
+        # Ensure correct shapes
+        if len(batch_df) < self.batch_size:
+            pad_size = self.batch_size - len(batch_df)
+            X_img = np.pad(X_img, ((0, pad_size), (0, 0), (0, 0), (0, 0)), mode='constant')
+            X_csv = np.pad(X_csv, ((0, pad_size), (0, 0)), mode='constant')
+            y_reg = np.pad(y_reg, ((0, pad_size), (0, 0)), mode='constant')
+            y_fert = np.pad(y_fert, (0, pad_size), mode='constant', constant_values=-1)
+            y_land = np.pad(y_land, (0, pad_size), mode='constant', constant_values=-1)
+
+        return {
+            'image_input': X_img,
+            'csv_input': X_csv
+        }, {
+            'fertility_reg': y_reg,
+            'fertility_cls': y_fert,
+            'land_use': y_land
+        }   
+       
+    
+    def on_epoch_end(self):
+        self.indices = np.arange(len(self.df))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+# --- TRAINING AND EVALUATION ---
+def prepare_datasets(df, csv_features, test_size=0.2):
+    """Prepare train and test generators with stratified splitting"""
+    # Create train-test split indices
+    train_idx, test_idx = train_test_split(
+        np.arange(len(df)),
+        test_size=test_size,
+        random_state=42,
+        stratify=df['fertility_class_encoded']
+    )
+    
+    # Create generators
+    train_gen = EnhancedSoilGenerator(
+        df.iloc[train_idx], 
+        csv_features,
+        batch_size=BATCH_SIZE
+    )
+    test_gen = EnhancedSoilGenerator(
+        df.iloc[test_idx], 
+        csv_features,
+        batch_size=BATCH_SIZE,
+        shuffle=False
+    )
+    
+    return train_gen, test_gen
+
+def compute_class_weights(df, fertility_encoder, land_use_encoder):
+    """Compute class weights for imbalanced datasets"""
+    # Convert to plain Python types in the weights dictionary
+    fertility_weights = compute_class_weight(
+        'balanced',
+        classes=np.unique(df['fertility_class_encoded']),
+        y=df['fertility_class_encoded']
+    )
+    land_use_weights = compute_class_weight(
+        'balanced',
+        classes=np.unique(df['land_use_encoded']),
+        y=df['land_use_encoded']
+    )
+    
+    return {
+        'fertility_cls': {int(k): float(v) for k, v in zip(np.unique(df['fertility_class_encoded']), fertility_weights)},
+        'land_use': {int(k): float(v) for k, v in zip(np.unique(df['land_use_encoded']), land_use_weights)}
+    }
+
+
+
+    
+def train_enhanced_model(model, train_gen, test_gen, class_weights):
+    """Enhanced training procedure"""
+    def robust_huber(y_true, y_pred):
+        return tf.keras.losses.huber(y_true, y_pred, delta=2.0)
+    
+    loss_weights = {
+        'fertility_reg': 0.4,
+        'fertility_cls': 0.3,
+        'land_use': 0.3
+    }
+    
+    loss = {
+        'fertility_reg': robust_huber,
+        'fertility_cls': 'sparse_categorical_crossentropy',
+        'land_use': 'sparse_categorical_crossentropy'
+    }
+    
+    metrics = {
+        'fertility_reg': ['mae', tf.keras.metrics.RootMeanSquaredError()],
+        'fertility_cls': ['accuracy', tf.keras.metrics.AUC(name='auc')],
+        'land_use': ['accuracy', tf.keras.metrics.AUC(name='auc')]
+    }
+    
+    optimizer = optimizers.AdamW(
+        learning_rate=LEARNING_RATE,
+        weight_decay=1e-4,
+        clipnorm=1.0
+    )
+    
+    model.compile(
+        optimizer=optimizer,
+        loss=loss,
+        loss_weights=loss_weights,
+        metrics=metrics
+    )
+    
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=PATIENCE*2,
+            restore_best_weights=True,
+            min_delta=0.001,
+            verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.1,
+            patience=PATIENCE//2,
+            min_lr=1e-6,
+            verbose=1
+        ),
+        ModelCheckpoint(
+            'best_model.h5',
+            save_best_only=True,
+            monitor='val_loss',
+            mode='min',
+            verbose=1
+        )
+    ]
+    
+    # Prepare sample weights
+    def get_sample_weights(generator, weight_dict, target_name):
+        weights = np.ones(len(generator.df), dtype=np.float32)
+        for i in range(len(generator)):
+            batch_start = i * generator.batch_size
+            batch_end = min((i + 1) * generator.batch_size, len(generator.df))
+            batch_indices = range(batch_start, batch_end)
+            weights[batch_indices] = [weight_dict.get(int(c), 1.0) for c in 
+                                    generator.df.iloc[batch_indices][target_name]]
+        return weights
+    
+    fertility_weights = get_sample_weights(train_gen, class_weights['fertility_cls'], 
+                                         'fertility_class_encoded')
+    land_use_weights = get_sample_weights(train_gen, class_weights['land_use'], 
+                                        'land_use_encoded')
+    
+    # Create training dataset with weights
+    def train_generator():
+        for i in range(len(train_gen)):
+            X, y = train_gen[i]
+            batch_start = i * train_gen.batch_size
+            batch_end = min((i + 1) * train_gen.batch_size, len(train_gen.df))
+            batch_indices = range(batch_start, batch_end)
+            
+            dummy_w = np.ones_like(fert_w, dtype=np.float32)
+            fert_w = fertility_weights[batch_indices]
+            land_w = land_use_weights[batch_indices]
+            yield X, y, {'fertility_reg': dummy_w,'fertility_cls': fert_w, 'land_use': land_w}
+
+           
+    
+    train_dataset = tf.data.Dataset.from_generator(
+        train_generator,
+        output_signature=(
+            {
+                'image_input': tf.TensorSpec(shape=(None, *IMAGE_SHAPE)),  # Images
+                'csv_input': tf.TensorSpec(shape=(None, len(train_gen.csv_features)))  # CSV features
+            },
+            {
+                'fertility_reg': tf.TensorSpec(shape=(None, 1),  dtype=tf.float32),
+                'fertility_cls': tf.TensorSpec(shape=(None,),  dtype=tf.int32),
+                'land_use': tf.TensorSpec(shape=(None,), dtype=tf.int32)
+            },
+            {
+                'fertility_cls': tf.TensorSpec(shape=(None,), dtype=tf.float32),
+                'land_use': tf.TensorSpec(shape=(None,), dtype=tf.float32)
+            }
+        )
+    ).prefetch(tf.data.AUTOTUNE)
+    
+    # Create test dataset without weights
+    def test_generator():
+        for i in range(len(test_gen)):
+            X, y = test_gen[i]
+            yield {'image_input': X[0], 'csv_input': X[1]}, y
+    
+    test_dataset = tf.data.Dataset.from_generator(
+        test_generator,
+        output_signature=(
+            {
+                'image_input': tf.TensorSpec(shape=(None, *IMAGE_SHAPE)),
+                'csv_input': tf.TensorSpec(shape=(None, len(test_gen.csv_features)))
+            },
+            {
+                'fertility_reg': tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+                'fertility_cls': tf.TensorSpec(shape=(None,), dtype=tf.int32),
+                'land_use': tf.TensorSpec(shape=(None,), dtype=tf.int32)
+            },
+            {
+                'fertility_cls': tf.TensorSpec(shape=(None,), dtype=tf.float32),
+                'land_use': tf.TensorSpec(shape=(None,), dtype=tf.float32)
+            }
+        )
+    ).prefetch(tf.data.AUTOTUNE)
+    
+    history = model.fit(
+        train_dataset,
+        validation_data=test_dataset,
+        epochs=EPOCHS,
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    return history
+
+def evaluate_model(model, test_gen, fertility_encoder, land_use_encoder):
+    """Comprehensive model evaluation"""
+    y_true_reg, y_true_fert, y_true_land = [], [], []
+    y_pred_reg, y_pred_fert, y_pred_land = [], [], []
+    
+    for i in range(len(test_gen)):
+        X, y_true = test_gen[i]
+        y_pred = model.predict(X, verbose=0)
+        
+        y_true_reg.append(y_true['fertility_reg'])
+        y_true_fert.append(y_true['fertility_cls'])
+        y_true_land.append(y_true['land_use'])
+        
+        y_pred_reg.append(y_pred[0])
+        y_pred_fert.append(y_pred[1])
+        y_pred_land.append(y_pred[2])
+    
+    y_true_reg = np.concatenate(y_true_reg)
+    y_true_fert = np.concatenate(y_true_fert)
+    y_true_land = np.concatenate(y_true_land)
+    
+    y_pred_reg = np.concatenate(y_pred_reg)
+    y_pred_fert = np.concatenate(y_pred_fert)
+    y_pred_land = np.concatenate(y_pred_land)
+    
+    y_pred_fert_cls = np.argmax(y_pred_fert, axis=1)
+    y_pred_land_cls = np.argmax(y_pred_land, axis=1)
+    
+    print("\n=== Model Evaluation ===")
+    
+    print("\nFertility Score Regression Evaluation:")
+    print(f"MAE: {mean_absolute_error(y_true_reg, y_pred_reg):.4f}")
+    print(f"RMSE: {mean_squared_error(y_true_reg, y_pred_reg, squared=False):.4f}")
+    print(f"R²: {r2_score(y_true_reg, y_pred_reg):.4f}")
+    
+    print("\nFertility Classification Evaluation:")
+    print(classification_report(
+        y_true_fert, y_pred_fert_cls, 
+        target_names=fertility_encoder.classes_,
+        digits=4
+    ))
+    
+    print("\nLand Use Classification Evaluation:")
+    print(classification_report(
+        y_true_land, y_pred_land_cls,
+        target_names=land_use_encoder.classes_,
+        digits=4
+    ))
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    print("Starting enhanced soil fertility prediction pipeline...")
+    
+    # 1. Load and preprocess data
+    print("\nLoading and preprocessing data...")
+    df = load_and_clean_data()
+    df = classify_soil_fertility(df)
+    df = calculate_fertility_score(df)
+    
+    # Match images
+    df, missing = match_images(df)
+    print(f"\nFound images for {len(df)} samples")
+    if missing:
+        print(f"Missing images for {len(missing)} samples")
+    
+    # Encode categorical targets
+    fertility_encoder = LabelEncoder()
+    land_use_encoder = LabelEncoder()
+    df['fertility_class_encoded'] = fertility_encoder.fit_transform(df['Fertility_Class'])
+    df['land_use_encoded'] = land_use_encoder.fit_transform(df['LU1_Desc'])
+    
+    # Select CSV features
+    csv_features = [
+        'Depth_code', 'pH_CaCl2', 'pH_H2O', 'EC', 'OC', 'CaCO3', 'P', 'N', 'K',
+        'OC (20-30 cm)', 'CaCO3 (20-30 cm)', 'Ox_Al', 'Ox_Fe', 'TH_LAT', 'TH_LONG', 'Elev'
+    ]
+    csv_features = [f for f in csv_features if f in df.columns]
+    
+    # 2. Prepare data generators
+    print("\nPreparing data generators...")
+    train_gen, test_gen = prepare_datasets(df, csv_features)
+    
+    # 3. Compute class weights
+    print("\nComputing class weights...")
+    class_weights = compute_class_weights(df, fertility_encoder, land_use_encoder)
+    for i in range(min(3, len(train_gen))):  # Check first 3 batches
+        X, y = train_gen[i]
+        print(f"\nBatch {i}:")
+        print(f"Images shape: {X['image_input'].shape}")
+        print(f"CSV features shape: {X['csv_input'].shape}")
+        print(f"Regression targets shape: {y['fertility_reg'].shape}")
+        print(f"Fertility classes shape: {y['fertility_cls'].shape}")
+        print(f"Land use classes shape: {y['land_use'].shape}")
+        print(f"Unique fertility classes: {np.unique(y['fertility_cls'])}")
+        print(f"Unique land use classes: {np.unique(y['land_use'])}")
+
+    # Verify class weights
+    print("\nClass weights verification:")
+    print("Fertility classes:", fertility_encoder.classes_)
+    print("Fertility weights:", class_weights['fertility_cls'])
+    print("Land use classes:", land_use_encoder.classes_)
+    print("Land use weights:", class_weights['land_use'])
+        
+    # 4. Build enhanced model
+    print("\nBuilding enhanced model...")
+    model = build_enhanced_model(
+        num_fertility_classes=len(fertility_encoder.classes_),
+        num_land_use_classes=len(land_use_encoder.classes_),
+        num_csv_features=len(csv_features)
+    )
+    
+    model.summary()
+    
+    # 5. Train model
+    print("\nTraining model...")
+    history = train_enhanced_model(model, train_gen, test_gen, class_weights)
+    
+    # 6. Evaluate model
+    print("\nEvaluating model...")
+    evaluate_model(model, test_gen, fertility_encoder, land_use_encoder)
+    
+    # 7. Save model and encoders
+    print("\nSaving model and artifacts...")
+    model.save("soil_fertility_land_use_model.h5")
+    
+    import joblib
+    joblib.dump(fertility_encoder, 'fertility_encoder.pkl')
+    joblib.dump(land_use_encoder, 'land_use_encoder.pkl')
+    joblib.dump(csv_features, 'csv_features.pkl')
+    
+    print("\nPipeline completed successfully!")

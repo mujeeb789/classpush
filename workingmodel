@@ -1,0 +1,771 @@
+
+# Soil Fertility Classifier: Train & Test Multiple Models
+# Models: EfficientNetB0, ResNet50V2, Vision Transformer (ViT)
+# Adapted for Soil Fertility Prediction with Multi-Task Learning
+
+import os
+import sys
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, mean_absolute_error, r2_score
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# CONFIGURATION - Adapted for Soil Fertility
+
+from config import CSV_PATH, DOWNLOAD_DIR, SUFFIXES, SCORE_WEIGHTS, IMAGE_SHAPE
+PROJECT_ROOT = os.getcwd()
+CLEAN_DATA_PATH = os.path.join(PROJECT_ROOT, "soil_fertility_clean_data.csv")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "soil_models")
+
+# Create models directory
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Model constants
+IMG_SIZE = IMAGE_SHAPE[0]
+BATCH_SIZE = 16
+EPOCHS = 50
+NUM_FERTILITY_CLASSES = 3  # Low, Moderate, High
+
+
+# DATA LOADING & PREPROCESSING FUNCTIONS
+
+
+def calculate_fertility_score(df, weights=None):
+    """Calculate fertility score if missing from the data"""
+    if weights is None:
+        weights = SCORE_WEIGHTS
+        
+    # Ensure required columns exist
+    required_cols = ['pH_H2O', 'OC', 'N', 'P', 'K', 'land_use_code']
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = 0.0 if col != 'land_use_code' else 0
+            
+    # Normalize pH
+    ph_range = weights['ph']['max'] - weights['ph']['min']
+    df['ph_norm'] = np.clip(
+        (df['pH_H2O'] - weights['ph']['min']) / max(ph_range, 0.1), 0, 1
+    )
+    
+    # Normalize Organic Carbon
+    df['oc_norm'] = np.clip(df['OC'] / max(weights['oc']['max'], 1.0), 0, 1)
+    
+    # Nutrient balance
+    df['nutrient_balance'] = (
+        np.log1p(df['N'].fillna(0)) + 
+        np.log1p(df['P'].fillna(0)) + 
+        np.log1p(df['K'].fillna(0))
+    )
+    
+    # Normalize nutrient balance
+    if df['nutrient_balance'].nunique() > 1:
+        nut_min = df['nutrient_balance'].min()
+        nut_max = df['nutrient_balance'].max()
+        df['nutrient_balance_norm'] = (df['nutrient_balance'] - nut_min) / max((nut_max - nut_min), 0.1)
+    else:
+        df['nutrient_balance_norm'] = 0.5
+        
+    # Normalize land use
+    if df['land_use_code'].nunique() > 1:
+        land_use_max = df['land_use_code'].max()
+        land_use_norm = df['land_use_code'] / max(land_use_max, 1)
+    else:
+        land_use_norm = 0.5
+        
+    # Combined score
+    df['fertility_score_advanced'] = (
+        weights['ph']['weight'] * df['ph_norm'] +
+        weights['oc']['weight'] * df['oc_norm'] +
+        weights['nutrients']['weight'] * df['nutrient_balance_norm'] +
+        weights['land_use']['weight'] * land_use_norm
+    ) * 100.0
+    
+    return df
+
+def check_and_prepare_data(df):
+    """Check for required columns and prepare data for training"""
+    print("🔍 Checking data structure...")
+    
+    # Check required columns
+    required_columns = {
+        'photo_path': 'Image paths',
+        'Fertility_Class': 'Fertility classification', 
+        'LU1_Desc': 'Land use descriptions'
+    }
+    
+    missing_columns = [col for col in required_columns.keys() if col not in df.columns]
+    if missing_columns:
+        print(f"❌ Missing required columns: {missing_columns}")
+        return None
+    
+    # Check if fertility_score_advanced exists, if not calculate it
+    if 'fertility_score_advanced' not in df.columns:
+        print("📊 Calculating fertility scores...")
+        df = calculate_fertility_score(df)
+    
+    # Check for soil parameter columns
+    soil_params = ['OC', 'pH_H2O', 'P', 'K', 'N', 'EC', 'CaCO3']
+    available_params = [param for param in soil_params if param in df.columns]
+    print(f"✅ Available soil parameters: {available_params}")
+    
+    if len(available_params) == 0:
+        print("❌ No soil parameters found for training!")
+        return None
+    
+    return df, available_params
+
+def load_and_preprocess_soil_data():
+    """Load and preprocess soil data for multi-task learning."""
+    if not os.path.exists(CLEAN_DATA_PATH):
+        print(f"❌ Clean soil data not found at {CLEAN_DATA_PATH}")
+        print("👉 Please run the exploration script first!")
+        return None, None
+    
+    df = pd.read_csv(CLEAN_DATA_PATH)
+    print(f"✅ Loaded {len(df)} soil samples")
+
+    # Check and prepare data
+    result = check_and_prepare_data(df)
+    if result is None:
+        return None, None
+    
+    df, available_params = result
+    
+    # Check required columns
+    required_cols = ['photo_path', 'Fertility_Class', 'LU1_Desc']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        print(f"❌ Missing required columns: {missing_cols}")
+        return None, None
+    
+    # Filter valid samples
+    df['photo_exists'] = df['photo_path'].apply(lambda x: x is not None and os.path.exists(x) if pd.notna(x) else False)
+    df = df[df['photo_exists']].copy()
+    
+    if len(df) == 0:
+        print("❌ No valid samples with images found!")
+        return None, None
+    
+    print(f"✅ {len(df)} samples with valid images")
+    
+    # Define available soil parameters
+    soil_params = ['OC', 'pH_H2O', 'P', 'K', 'N', 'EC', 'CaCO3', 'Depth_code']
+    available_params = [param for param in soil_params if param in df.columns]
+    
+    return df, available_params
+
+
+def build_soil_dataset(df, csv_features, shuffle=True, augment=False):
+    """Build tf.data.Dataset for multi-task soil fertility prediction."""
+    
+    # Encode targets
+    fertility_encoder = LabelEncoder()
+    land_use_encoder = LabelEncoder()
+    
+    df['fertility_encoded'] = fertility_encoder.fit_transform(df['Fertility_Class'])
+    df['land_use_encoded'] = land_use_encoder.fit_transform(df['LU1_Desc'])
+    
+    # Calculate number of land use classes
+    num_land_use_classes = len(df['LU1_Desc'].unique())
+    
+    # Scale CSV features
+    scaler = StandardScaler()
+    csv_data = scaler.fit_transform(df[csv_features].fillna(0).values)
+    
+    # Convert to tensors
+    image_paths = tf.constant(df['photo_path'].values)
+    csv_tensor = tf.constant(csv_data, dtype=tf.float32)
+    fertility_scores = tf.constant(df['fertility_score_advanced'].values, dtype=tf.float32)
+    fertility_classes = tf.constant(df['fertility_encoded'].values, dtype=tf.int32)
+    land_use_classes = tf.constant(df['land_use_encoded'].values, dtype=tf.int32)
+    
+    def load_and_preprocess_image(path):
+        """Load and preprocess a single image with robust error handling."""
+        try:
+            # Read the file
+            img_data = tf.io.read_file(path)
+            
+            # Try to decode JPEG
+            img = tf.image.decode_jpeg(img_data, channels=3)
+            
+            # Check if image is valid
+            img_shape = tf.shape(img)
+            is_valid = tf.reduce_all(img_shape > 0)
+            
+            # Use valid image or create blank one
+            img = tf.cond(
+                is_valid,
+                lambda: img,
+                lambda: tf.zeros([IMG_SIZE, IMG_SIZE, 3], dtype=tf.uint8)
+            )
+            
+            # Resize and normalize
+            img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
+            img = tf.cast(img, tf.float32) / 255.0
+            
+            return img
+            
+        except Exception:
+            # Return blank image on any error
+            return tf.zeros([IMG_SIZE, IMG_SIZE, 3], dtype=tf.float32) / 255.0
+    
+    def process_sample(i):
+        """Process a single sample."""
+        i = i.numpy()
+        img = load_and_preprocess_image(image_paths[i])
+        csv_feat = csv_tensor[i]
+        fertility_score = fertility_scores[i]
+        fertility_class = fertility_classes[i]
+        land_use = land_use_classes[i]
+        
+        return img, csv_feat, fertility_score, fertility_class, land_use
+    
+    # Create dataset
+    dataset = tf.data.Dataset.range(len(df))
+    
+    if shuffle:
+        dataset = dataset.shuffle(len(df))
+    
+    # Use py_function with separate outputs
+    dataset = dataset.map(
+        lambda i: tf.py_function(
+            func=process_sample,
+            inp=[i],
+            Tout=[tf.float32, tf.float32, tf.float32, tf.int32, tf.int32]
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    
+    # Set shapes and structure into final format
+    def structure_output(img, csv, reg, cls, lu):
+        img.set_shape((IMG_SIZE, IMG_SIZE, 3))
+        csv.set_shape((len(csv_features),))
+        reg.set_shape(())
+        cls.set_shape(())
+        lu.set_shape(())
+        
+        # Structure into final format that model expects
+        inputs = (img, csv)
+        targets = {
+            'fertility_reg': reg,
+            'fertility_cls': cls, 
+            'land_use': lu
+        }
+        return inputs, targets
+    
+    dataset = dataset.map(structure_output, num_parallel_calls=tf.data.AUTOTUNE)
+    
+    if augment:
+        def augment_data(inputs, targets):
+            img, csv = inputs
+            # Apply augmentations only to images
+            img = tf.image.random_flip_left_right(img)
+            img = tf.image.random_flip_up_down(img)
+            img = tf.image.random_brightness(img, 0.2)
+            img = tf.clip_by_value(img, 0.0, 1.0)
+            return (img, csv), targets
+        
+        dataset = dataset.map(augment_data, num_parallel_calls=tf.data.AUTOTUNE)
+    
+    dataset = dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    return dataset, scaler, fertility_encoder, land_use_encoder, num_land_use_classes
+
+
+
+# MODEL ARCHITECTURES - Multi-Task Learning
+
+
+def get_model(model_name, num_csv_features, num_land_use_classes):
+    """Return compiled multi-task model based on name."""
+    
+    # Image input
+    img_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
+    
+    # CSV features input
+    csv_input = layers.Input(shape=(num_csv_features,), name='csv_input')
+    
+    if model_name == "efficientnet":
+        base = tf.keras.applications.EfficientNetB0(
+            include_top=False, weights='imagenet', input_tensor=img_input
+        )
+    elif model_name == "resnet":
+        base = tf.keras.applications.ResNet50V2(
+            include_top=False, weights='imagenet', input_tensor=img_input
+        )
+    elif model_name == "vit":
+        return build_vit_multitask_model(num_csv_features, num_land_use_classes)
+    else:
+        raise ValueError("Unknown model")
+
+    # Freeze base initially
+    base.trainable = False
+    
+    # Image branch
+    img_features = base.output
+    img_features = layers.GlobalAveragePooling2D()(img_features)
+    img_features = layers.BatchNormalization()(img_features)
+    img_features = layers.Dropout(0.3)(img_features)
+    
+    # CSV branch
+    csv_features = layers.Dense(128, activation='relu')(csv_input)
+    csv_features = layers.BatchNormalization()(csv_features)
+    csv_features = layers.Dropout(0.3)(csv_features)
+    
+    # Combined features
+    combined = layers.Concatenate()([img_features, csv_features])
+    combined = layers.Dense(256, activation='relu')(combined)
+    combined = layers.BatchNormalization()(combined)
+    combined = layers.Dropout(0.4)(combined)
+    
+    # Output heads
+    # Regression head for fertility score
+    fertility_reg = layers.Dense(128, activation='relu')(combined)
+    fertility_reg_output = layers.Dense(1, activation='linear', name='fertility_reg')(fertility_reg)
+    
+    # Classification head for fertility class
+    fertility_cls = layers.Dense(128, activation='relu')(combined)
+    fertility_cls_output = layers.Dense(NUM_FERTILITY_CLASSES, activation='softmax', name='fertility_cls')(fertility_cls)
+    
+    # Classification head for land use
+    land_use = layers.Dense(128, activation='relu')(combined)
+    land_use_output = layers.Dense(num_land_use_classes, activation='softmax', name='land_use')(land_use)
+    
+    model = keras.Model(inputs=[img_input, csv_input], 
+                       outputs=[fertility_reg_output, fertility_cls_output, land_use_output])
+    
+    # Custom loss weights
+    losses = {
+        'fertility_reg': 'mse',
+        'fertility_cls': 'sparse_categorical_crossentropy',
+        'land_use': 'sparse_categorical_crossentropy'
+    }
+    
+    loss_weights = {
+        'fertility_reg': 0.4,
+        'fertility_cls': 0.4,
+        'land_use': 0.2
+    }
+    
+    metrics = {
+        'fertility_reg': ['mae', 'mse'],
+        'fertility_cls': ['accuracy'],
+        'land_use': ['accuracy']
+    }
+    
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss=losses,
+        loss_weights=loss_weights,
+        metrics=metrics
+    )
+    
+    return model
+
+def build_vit_multitask_model(num_csv_features, num_land_use_classes):
+    """Build Vision Transformer for multi-task soil fertility prediction."""
+
+    # ViT parameters
+    patch_size = 16
+    num_patches = (IMG_SIZE // patch_size) ** 2
+    projection_dim = 64
+    num_heads = 4
+    transformer_layers = 4
+    
+    # Image input and patching
+    img_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='image_input')
+    patches = Patches(patch_size)(img_input)
+    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
+    
+    # Transformer blocks
+    for _ in range(transformer_layers):
+        # Layer normalization 1
+        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+        
+        # Multi-head attention
+        attention_output = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
+        )(x1, x1)
+        
+        # Skip connection 1
+        x2 = layers.Add()([attention_output, encoded_patches])
+        
+        # Layer normalization 2
+        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+        
+        # MLP
+        x3 = layers.Dense(projection_dim * 2, activation=tf.nn.gelu)(x3)
+        x3 = layers.Dropout(0.1)(x3)
+        x3 = layers.Dense(projection_dim, activation=tf.nn.gelu)(x3)
+        x3 = layers.Dropout(0.1)(x3)
+        
+        # Skip connection 2
+        encoded_patches = layers.Add()([x3, x2])
+    
+    # ViT representation
+    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+    representation = layers.GlobalAveragePooling1D()(representation)
+    representation = layers.Dropout(0.2)(representation)
+    
+    # CSV input branch
+    csv_input = layers.Input(shape=(num_csv_features,), name='csv_input')
+    csv_features = layers.Dense(128, activation='relu')(csv_input)
+    csv_features = layers.BatchNormalization()(csv_features)
+    csv_features = layers.Dropout(0.3)(csv_features)
+
+    
+    
+    
+    # Combine ViT features with CSV features
+    combined = layers.Concatenate()([representation, csv_features])
+    combined = layers.Dense(256, activation='relu')(combined)
+    combined = layers.BatchNormalization()(combined)
+    combined = layers.Dropout(0.4)(combined)
+    
+    # Output heads (same as other models)
+    fertility_reg = layers.Dense(128, activation='relu')(combined)
+    fertility_reg_output = layers.Dense(1, activation='linear', name='fertility_reg')(fertility_reg)
+    
+    fertility_cls = layers.Dense(128, activation='relu')(combined)
+    fertility_cls_output = layers.Dense(NUM_FERTILITY_CLASSES, activation='softmax', name='fertility_cls')(fertility_cls)
+    
+    land_use = layers.Dense(128, activation='relu')(combined)
+    land_use_output = layers.Dense(num_land_use_classes, activation='softmax', name='land_use')(land_use)
+    
+    model = keras.Model(inputs=[img_input, csv_input], 
+                       outputs=[fertility_reg_output, fertility_cls_output, land_use_output])
+    
+    # Compile with same settings
+    losses = {
+        'fertility_reg': 'mse',
+        'fertility_cls': 'sparse_categorical_crossentropy',
+        'land_use': 'sparse_categorical_crossentropy'
+    }
+    
+    loss_weights = {
+        'fertility_reg': 0.4,
+        'fertility_cls': 0.4,
+        'land_use': 0.2
+    }
+    
+    metrics = {
+        'fertility_reg': ['mae', 'mse'],
+        'fertility_cls': ['accuracy'],
+        'land_use': ['accuracy']
+    }
+    
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss=losses,
+        loss_weights=loss_weights,
+        metrics=metrics
+    )
+    
+    return model
+
+# ViT Helper Layers (same as before)
+class Patches(layers.Layer):
+    def __init__(self, patch_size):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def call(self, images):
+        batch_size = tf.shape(images)[0]
+        patches = tf.image.extract_patches(
+            images=images,
+            sizes=[1, self.patch_size, self.patch_size, 1],
+            strides=[1, self.patch_size, self.patch_size, 1],
+            rates=[1, 1, 1, 1],
+            padding="VALID",
+        )
+        patch_dims = patches.shape[-1]
+        patches = tf.reshape(patches, [batch_size, -1, patch_dims])
+        return patches
+
+class PatchEncoder(layers.Layer):
+    def __init__(self, num_patches, projection_dim):
+        super().__init__()
+        self.num_patches = num_patches
+        self.projection = layers.Dense(units=projection_dim)
+        self.position_embedding = layers.Embedding(
+            input_dim=num_patches, output_dim=projection_dim
+        )
+
+    def call(self, patch):
+        positions = tf.range(start=0, limit=self.num_patches, delta=1)
+        encoded = self.projection(patch) + self.position_embedding(positions)
+        return encoded
+
+# TRAINING FUNCTION
+
+
+def train_model(model_name):
+    print(f"\n🚀 Training {model_name.upper()} for Soil Fertility Prediction...")
+    
+    # Load data
+    df, csv_features = load_and_preprocess_soil_data()
+    if df is None:
+        return
+    
+    print(f"📊 Using {len(csv_features)} soil parameters: {csv_features}")
+    
+    # Split data
+    train_size = int(0.8 * len(df))
+    df_train = df.sample(n=train_size, random_state=42)
+    df_val = df.drop(df_train.index)
+    
+    print(f"📈 Training samples: {len(df_train)}")
+    print(f"📊 Validation samples: {len(df_val)}")
+    
+    # Build datasets
+    train_ds, scaler, fertility_encoder, land_use_encoder, num_land_use_classes = build_soil_dataset(
+        df_train, csv_features, shuffle=True, augment=True
+    )
+    val_ds, _, _, _, _ = build_soil_dataset(
+        df_val, csv_features, shuffle=False, augment=False
+    )
+    # Add this right after building train_ds and val_ds
+    print("🔧 Debug: Checking dataset sample...")
+    try:
+        sample = next(iter(train_ds))
+        print("✅ Dataset structure is correct")
+        print(f"Inputs: {len(sample[0])} items")
+        print(f"Image shape: {sample[0][0].shape}")
+        print(f"CSV shape: {sample[0][1].shape}")
+        print(f"Targets keys: {list(sample[1].keys())}")
+        print(f"Fertility reg shape: {sample[1]['fertility_reg'].shape}")
+        print(f"Fertility cls shape: {sample[1]['fertility_cls'].shape}")
+        print(f"Land use shape: {sample[1]['land_use'].shape}")
+    except Exception as e:
+        print(f"❌ Dataset error: {e}")
+        return
+
+
+    # Get model
+    model = get_model(model_name, len(csv_features), num_land_use_classes)
+    
+    print("📋 Model Summary:")
+    model.summary()
+    
+    # Callbacks
+    model_path = os.path.join(MODELS_DIR, f"soil_model_{model_name}.keras")
+    
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=5, verbose=1
+        ),
+        keras.callbacks.ModelCheckpoint(
+            model_path, save_best_only=True, monitor='val_loss', verbose=1
+        )
+    ]
+    
+    # Training
+    print("🎯 Starting training...")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        callbacks=callbacks,
+        verbose=1
+    )
+     # Plot training history
+    plot_training_history(history, model_name)
+    
+    # Save encoders and scaler
+    import joblib
+    joblib.dump(fertility_encoder, os.path.join(MODELS_DIR, f'fertility_encoder_{model_name}.pkl'))
+    joblib.dump(land_use_encoder, os.path.join(MODELS_DIR, f'land_use_encoder_{model_name}.pkl'))
+    joblib.dump(scaler, os.path.join(MODELS_DIR, f'feature_scaler_{model_name}.pkl'))
+    joblib.dump(csv_features, os.path.join(MODELS_DIR, f'csv_features_{model_name}.pkl'))
+    joblib.dump(num_land_use_classes, os.path.join(MODELS_DIR, f'num_land_use_classes_{model_name}.pkl'))
+    
+    print(f"✅ Model and artifacts saved to: {model_path}")
+
+def plot_training_history(history, model_name):
+    """Plot training history for multi-task learning."""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # Loss plots
+    axes[0,0].plot(history.history['loss'], label='Train Total Loss')
+    axes[0,0].plot(history.history['val_loss'], label='Val Total Loss')
+    axes[0,0].set_title('Total Loss')
+    axes[0,0].legend()
+    
+    axes[0,1].plot(history.history['fertility_reg_loss'], label='Train Reg Loss')
+    axes[0,1].plot(history.history['val_fertility_reg_loss'], label='Val Reg Loss')
+    axes[0,1].set_title('Fertility Regression Loss')
+    axes[0,1].legend()
+    
+    axes[0,2].plot(history.history['fertility_cls_loss'], label='Train Cls Loss')
+    axes[0,2].plot(history.history['val_fertility_cls_loss'], label='Val Cls Loss')
+    axes[0,2].set_title('Fertility Classification Loss')
+    axes[0,2].legend()
+    
+    # Metric plots
+    axes[1,0].plot(history.history['fertility_reg_mae'], label='Train MAE')
+    axes[1,0].plot(history.history['val_fertility_reg_mae'], label='Val MAE')
+    axes[1,0].set_title('Fertility Score MAE')
+    axes[1,0].legend()
+    
+    axes[1,1].plot(history.history['fertility_cls_accuracy'], label='Train Acc')
+    axes[1,1].plot(history.history['val_fertility_cls_accuracy'], label='Val Acc')
+    axes[1,1].set_title('Fertility Classification Accuracy')
+    axes[1,1].legend()
+    
+    axes[1,2].plot(history.history['land_use_accuracy'], label='Train Acc')
+    axes[1,2].plot(history.history['val_land_use_accuracy'], label='Val Acc')
+    axes[1,2].set_title('Land Use Accuracy')
+    axes[1,2].legend()
+    
+    plt.suptitle(f'Training History - {model_name.upper()}', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PROJECT_ROOT, f"soil_training_{model_name}.png"), dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+# TESTING FUNCTION
+
+
+def test_model(model_name):
+    print(f"\n🧪 Testing {model_name.upper()} for Soil Fertility Prediction...")
+    
+    model_path = os.path.join(MODELS_DIR, f"soil_model_{model_name}.keras")
+    if not os.path.exists(model_path):
+        print(f"❌ Model not found at {model_path}")
+        print("👉 Train the model first!")
+        return
+    
+    # Load model and artifacts
+    import joblib
+    try:
+        if model_name == "vit":
+            # For ViT, we neeed to rebuild the model architecture first
+            csv_features = joblib.load(os.path.join(MODELS_DIR, f'csv_features_{model_name}.pkl'))
+            num_land_use_classes = joblib.load(os.path.join(MODELS_DIR, f'num_land_use_classes_{model_name}.pkl'))
+            model_name = build_vit_multitask_model(len(csv_features), num_land_use_classes)
+            model.load_weights(os.path.join(model_path, 'variables', 'variables'))
+
+        else:
+            model = keras.models.load_model(model_path)
+        fertility_encoder = joblib.load(os.path.join(MODELS_DIR, f'fertility_encoder_{model_name}.pkl'))
+        land_use_encoder = joblib.load(os.path.join(MODELS_DIR, f'land_use_encoder_{model_name}.pkl'))
+        scaler = joblib.load(os.path.join(MODELS_DIR, f'feature_scaler_{model_name}.pkl'))
+        csv_features = joblib.load(os.path.join(MODELS_DIR, f'csv_features_{model_name}.pkl'))
+        
+    except Exception as e:
+        print(f"❌ Error loading model artifacts: {e}")
+        return
+    
+    # Load test data
+    df, _ = load_and_preprocess_soil_data()
+    if df is None:
+        return
+    
+    # Use validation split for testing
+    train_size = int(0.8 * len(df))
+    df_test = df.iloc[train_size:]
+    
+    test_ds, _, _, _, _ = build_soil_dataset(df_test, csv_features, shuffle=False, augment=False)
+    
+    # Evaluate
+    print("📊 Evaluating model on test set...")
+    results = model.evaluate(test_ds, verbose=0)
+    
+    # Print results
+    print("\n📈 Test Results:")
+    print("-" * 50)
+    print(f"Total Loss: {results[0]:.4f}")
+    print(f"Fertility Regression MAE: {results[4]:.4f}")
+    print(f"Fertility Classification Accuracy: {results[5]:.4f} ({results[5]*100:.2f}%)")
+    print(f"Land Use Accuracy: {results[6]:.4f} ({results[6]*100:.2f}%)")
+    
+    # Make predictions on a sample
+    print("\n🔍 Single Sample Prediction:")
+    sample = df_test.sample(1).iloc[0]
+    
+    # Prepare inputs
+    img = tf.io.read_file(sample['photo_path'])
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
+    img = tf.cast(img, tf.float32) / 255.0
+    img = tf.expand_dims(img, 0)
+    
+    csv_data = scaler.transform([sample[csv_features].fillna(0).values])
+    
+    # Predict
+    pred_reg, pred_cls, pred_land = model.predict([img, csv_data], verbose=0)
+    
+    # Display results
+    true_fertility = sample['Fertility_Class']
+    pred_fertility = fertility_encoder.inverse_transform([np.argmax(pred_cls[0])])[0]
+    pred_score = pred_reg[0][0]
+    true_score = sample['fertility_score_advanced']
+    
+    print(f"🌱 True Fertility: {true_fertility} (Score: {true_score:.2f})")
+    print(f"🤖 Predicted Fertility: {pred_fertility} (Score: {pred_score:.2f})")
+    print(f"📊 Confidence: {np.max(pred_cls[0]):.2%}")
+
+    # Show image
+    img_np = tf.keras.utils.array_to_img(img[0])
+    plt.figure(figsize=(8, 6))
+    plt.imshow(img_np)
+    plt.title(f"True: {true_fertility} (Score: {true_score:.1f})\n"
+              f"Pred: {pred_fertility} (Score: {pred_score:.1f})\n"
+              f"Confidence: {np.max(pred_cls[0]):.1%}")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(os.path.join(PROJECT_ROOT, f"soil_prediction_{model_name}.png"), dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+
+# MAIN INTERACTIVE LOOP
+
+
+
+def main():
+    print("="*60)
+    print("🌱 Soil Fertility Multi-Task Classification - Train & Test")
+    print("="*60)
+    
+    # Mode selection
+    print("\nChoose mode:")
+    print("1. Train a model")
+    print("2. Test a model")
+    mode = input("Enter choice (1/2): ").strip()
+    
+    if mode not in ['1', '2']:
+        print("❌ Invalid choice.")
+        return
+    
+    # Model selection
+    print("\nChoose model:")
+    print("1. EfficientNetB0 + Soil Features")
+    print("2. ResNet50V2 + Soil Features") 
+    print("3. Vision Transformer (ViT) + Soil Features")
+    model_choice = input("Enter choice (1/2/3): ").strip()
+    
+    model_map = {'1': 'efficientnet', '2': 'resnet', '3': 'vit'}
+    if model_choice not in model_map:
+        print("❌ Invalid model choice.")
+        return
+    
+    model_name = model_map[model_choice]
+    
+    if mode == '1':
+        train_model(model_name)
+    else:
+        test_model(model_name)
+
+if __name__ == "__main__":
+    main()
